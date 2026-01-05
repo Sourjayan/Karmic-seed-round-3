@@ -55,3 +55,358 @@
 | **MN-48** | 7 Square (200pk) | Core | $89.90 | $68.98 | $86.23 | $88.20 | **$88.20** | **DECREASE** | Slightly above market average. Drop to align. |
 | **MN-49** | 11x7 Rectangle (50pk) | Core | $32.90 | $30.56 | $38.20 | $33.10 | **$38.20** | **INCREASE** | Margin gap exists. Raise to floor. |
 | **MN-50** | 9x6 Rectangle (50pk) | Core | $29.90 | $27.60 | $34.50 | $30.20 | **$34.50** | **INCREASE** | Margin gap exists. Raise to floor. |
+
+## python scripts
+```python
+import pandas as pd
+import numpy as np
+
+# ... (Assuming you loaded data_dict using the script in Part 1) ...
+
+def generate_final_pricing(data_dict):
+    
+    # 1. Extract Dataframes
+    ads = data_dict.get('Ads_Performance')
+    inventory = data_dict.get('Inventory_Health')
+    pricing = data_dict.get('Pricing_Data') # Contains Base Cost / Current Price
+    competitor = data_dict.get('Competitor_Data')
+
+    if not all([ads, inventory, pricing, competitor]):
+        print("Missing critical sheets. Cannot run full analysis.")
+        return
+
+    # 2. Pre-processing
+    
+    # Aggregate Ads Data to get ROAS and Velocity
+    ads_summary = ads.groupby('SKU').agg({
+        'sales30d': 'sum',
+        'unitsSoldClicks30d': 'sum',
+        'roasClicks14d': 'mean'
+    }).reset_index()
+
+    # Merge Current Price from Pricing Data (Assuming 'SKU' and 'price' columns exist)
+    # If pricing sheet is just a list of SKUs and prices:
+    merged = pd.merge(ads_summary, pricing[['SKU', 'price']], on='SKU', how='left')
+    
+    # Merge Inventory Health (Assuming 'SKU' and 'days_of_supply' columns)
+    merged = pd.merge(merged, inventory[['SKU', 'days_of_supply']], on='SKU', how='left')
+    
+    # Merge Competitor Data (Assuming 'SKU' and 'avg_competitor_price' columns)
+    merged = pd.merge(merged, competitor[['SKU', 'min_competitor_price', 'avg_competitor_price']], on='SKU', how='left')
+
+    # Fill NaNs for Inventory/Competitor with defaults if data is missing
+    merged['days_of_supply'].fillna(45, inplace=True) # Assume healthy if missing
+    merged['avg_competitor_price'].fillna(merged['price'], inplace=True) # Assume no competitors if missing
+
+    # 3. Apply Logic
+    recommendations = []
+
+    for _, row in merged.iterrows():
+        sku = row['SKU']
+        current_price = row['price']
+        roas = row['roasClicks14d']
+        days_supply = row['days_of_supply']
+        comp_avg = row['avg_competitor_price']
+        
+        rec_price = current_price
+        action = "HOLD"
+        rationale = "Price optimized for market and efficiency."
+
+        # --- LOGIC HIERARCHY ---
+
+        # RULE 1: Inventory Urgency (Highest Priority)
+        if days_supply < 14:
+            action = "INCREASE"
+            rec_price = current_price * 1.15
+            rationale = "CRITICAL STOCK (<14 days). Raising price to slow sales and maximize margin."
+
+        elif days_supply > 90:
+            action = "DECREASE"
+            rec_price = current_price * 0.90
+            rationale = "OVERSTOCKED (>90 days). Discounting to clear inventory."
+
+        # RULE 2: Competitor Gap (Only if Inventory is okay)
+        elif 14 <= days_supply <= 90:
+            
+            # We are significantly more expensive than market
+            if current_price > (comp_avg * 1.1): 
+                action = "DECREASE"
+                rec_price = comp_avg * 1.02 # Price slightly above average
+                rationale = "Uncompetitive pricing. Dropping to market average."
+
+            # We are significantly cheaper than market
+            elif current_price < (comp_avg * 0.9):
+                action = "INCREASE"
+                rec_price = comp_avg * 0.98 # Price slightly below average
+                rationale = "Underpriced vs Market. Increasing to capture margin."
+
+            # RULE 3: Ad Efficiency (Tie-breaker)
+            else:
+                if roas < 2.0:
+                    action = "DECREASE"
+                    rec_price = current_price * 0.95
+                    rationale = "Low conversion (ROAS < 2). Small price cut to boost traffic."
+                elif roas > 5.0:
+                    action = "INCREASE"
+                    rec_price = current_price * 1.05
+                    rationale = "High demand (ROAS > 5). Testing price elasticity."
+
+        recommendations.append({
+            'SKU': sku,
+            'Current_Price': round(current_price, 2),
+            'Inventory_Days': days_supply,
+            'Comp_Avg_Price': round(comp_avg, 2),
+            'ROAS': round(roas, 2),
+            'Action': action,
+            'Recommended_Price': round(rec_price, 2),
+            'Rationale': rationale
+        })
+
+    return pd.DataFrame(recommendations)
+
+# Usage example:
+# final_df = generate_final_pricing(data_dict)
+# print(final_df)
+```
+
+```python
+import pandas as pd
+import numpy as np
+import warnings
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings('ignore')
+
+def load_and_clean_data():
+    """
+    Loads all 6 datasets provided in the assignment.
+    """
+    print("--- Loading Data ---")
+    
+    # 1. Pricing Data (Base Costs and Prices)
+    pricing = pd.read_csv('Pricing_Data.csv')
+    # Clean currency symbols if present (e.g., $15.11 -> 15.11)
+    for col in ['FBA Fee', 'Storage Fee', 'Handling_Cost', 'Cost', 'Current_Price']:
+        pricing[col] = pricing[col].replace('[\$,]', '', regex=True).astype(float)
+    
+    # 2. Inventory Health (Supply levels)
+    inventory = pd.read_csv('Inventory_Health.csv')
+    # Ensure numeric
+    inventory['days-of-supply'] = pd.to_numeric(inventory['days-of-supply'], errors='coerce').fillna(0)
+    
+    # 3. Competitor Data (Market benchmarks)
+    competitor = pd.read_csv('Competitor_Data.csv')
+    for col in ['Avg_Competitor_Price', 'Lowest_Competitor_Price', 'Highest_Competitor_Price']:
+        competitor[col] = competitor[col].replace('[\$,]', '', regex=True).astype(float)
+    
+    # 4. Ads Performance (Efficiency)
+    ads = pd.read_csv('Ads_Performance.csv')
+    # Clean spend and sales columns
+    for col in ['spend', 'sales7d', 'sales14d', 'sales30d']:
+        ads[col] = ads[col].replace('[\$,]', '', regex=True).astype(float)
+    # Handle ROAS specifically (might be text or float)
+    ads['roasClicks7d'] = pd.to_numeric(ads['roasClicks7d'], errors='coerce').fillna(0)
+    
+    # 5. Historical Sales (Velocity)
+    sales = pd.read_csv('Historical_Sales.csv')
+    sales['Units Ordered'] = pd.to_numeric(sales['Units Ordered'], errors='coerce').fillna(0)
+    
+    # 6. Returns Data (Quality check)
+    returns = pd.read_csv('Returns_Data.csv')
+    
+    print("Data loaded successfully.\n")
+    return pricing, inventory, competitor, ads, sales, returns
+
+def calculate_economic_floor(pricing_df):
+    """
+    Calculates the minimum price required to meet 'Minimum_Acceptable_Margin_%'.
+    Formula: Price = Total Cost / (1 - Margin_%)
+    Total Cost = COGS + FBA Fee + Storage Fee + Handling Cost
+    """
+    pricing_df['Total_Unit_Cost'] = (
+        pricing_df['Cost'] + 
+        pricing_df['FBA Fee'] + 
+        pricing_df['Storage Fee'] + 
+        pricing_df['Handling_Cost']
+    )
+    
+    # Convert margin percentage to decimal (e.g., 20% -> 0.20)
+    pricing_df['min_margin_decimal'] = pricing_df['Minimum_Acceptable_Margin_%'].str.replace('%', '').astype(float) / 100
+    
+    # Calculate Floor Price
+    # Avoid division by zero if margin is 100% (unlikely) or missing
+    pricing_df['Min_Acceptable_Price'] = pricing_df.apply(
+        lambda row: row['Total_Unit_Cost'] / (1 - row['min_margin_decimal']) if row['min_margin_decimal'] < 1 else row['Total_Unit_Cost'] * 1.5,
+        axis=1
+    )
+    
+    return pricing_df
+
+def generate_recommendations(pricing, inventory, competitor, ads, sales, returns):
+    """
+    Merges datasets and applies the 4-step logic framework.
+    """
+    
+    # --- AGGREGATION ---
+    
+    # Aggregate Ads by SKU to get average ROAS
+    ads_agg = ads.groupby('SKU').agg({
+        'roasClicks7d': 'mean',
+        'sales7d': 'sum',
+        'spend': 'sum'
+    }).reset_index()
+    
+    # Aggregate Sales by SKU to get total units sold
+    sales_agg = sales.groupby('SKU').agg({
+        'Units Ordered': 'sum'
+    }).reset_index()
+    
+    # Aggregate Returns by SKU
+    returns_agg = returns.groupby('SKU').agg({
+        'Return Quantity \n(Last 90 days)': 'sum'
+    }).reset_index()
+    
+    # --- MERGING ---
+    
+    # Start with Pricing data
+    master_df = pricing[['SKU', 'Product_description', 'Current_Price', 'Min_Acceptable_Price', 'Total_Unit_Cost']]
+    
+    # Merge Inventory
+    master_df = master_df.merge(inventory[['SKU', 'days-of-supply', 'available']], on='SKU', how='left')
+    
+    # Merge Competitors
+    master_df = master_df.merge(competitor[['SKU', 'Avg_Competitor_Price', 'Lowest_Competitor_Price']], on='SKU', how='left')
+    
+    # Merge Ads
+    master_df = master_df.merge(ads_agg, on='SKU', how='left')
+    
+    # Merge Sales & Returns
+    master_df = master_df.merge(sales_agg, on='SKU', how='left')
+    master_df = master_df.merge(returns_agg, on='SKU', how='left')
+    
+    # Fill NaNs for calculation logic
+    master_df['roasClicks7d'].fillna(0, inplace=True)
+    master_df['days-of-supply'].fillna(45, inplace=True) # Assume healthy if missing
+    master_df['Avg_Competitor_Price'].fillna(master_df['Current_Price'], inplace=True)
+    master_df['Units Ordered'].fillna(0, inplace=True)
+    
+    # --- PRICING LOGIC ENGINE ---
+    
+    recommendations = []
+    
+    for index, row in master_df.iterrows():
+        sku = row['SKU']
+        current_price = row['Current_Price']
+        min_price = row['Min_Acceptable_Price']
+        days_supply = row['days-of-supply']
+        roas = row['roasClicks7d']
+        comp_avg = row['Avg_Competitor_Price']
+        units_sold = row['Units Ordered']
+        
+        # Calculate Return Rate
+        returns_qty = row.get('Return Quantity \n(Last 90 days)', 0)
+        return_rate = (returns_qty / units_sold) if units_sold > 0 else 0
+        
+        rec_price = current_price
+        action = "HOLD"
+        rationale = "Performance within acceptable parameters."
+        
+        # --- STEP 1: INVENTORY CHECK (Highest Priority) ---
+        
+        # Critical Stockout: Aggressive Increase
+        if days_supply <= 10:
+            rec_price = current_price * 1.10
+            action = "INCREASE"
+            rationale = f"CRITICAL STOCK ({days_supply:.1f} days). Increasing price to extend inventory coverage."
+            
+        # Overstock: Decrease to Liquidate
+        elif days_supply >= 90:
+            rec_price = current_price * 0.90
+            action = "DECREASE"
+            rationale = f"OVERSTOCKED ({days_supply:.1f} days). Discounting to clear inventory and reduce fees."
+            
+        # --- STEP 2: MARGIN CORRECTION (If Inventory is Healthy) ---
+        
+        elif current_price < min_price:
+            rec_price = min_price * 1.05 # Add 5% buffer above min
+            action = "INCREASE"
+            rationale = "Current price is below Minimum Acceptable Margin. Correcting pricing."
+            
+        # --- STEP 3: EFFICIENCY CHECK (If Inventory Healthy & Margin Met) ---
+        
+        else:
+            # High ROAS: Underpriced? Capture Margin.
+            if roas >= 4.0:
+                rec_price = current_price * 1.05
+                action = "INCREASE"
+                rationale = "High Advertising Efficiency (ROAS > 4). Testing price elasticity."
+                
+            # Low ROAS: Overpriced? Boost Conversion.
+            elif roas > 0 and roas <= 1.5:
+                rec_price = current_price * 0.95
+                action = "DECREASE"
+                rationale = "Low Conversion/ROAS (< 1.5). Reducing price to stimulate demand."
+                
+            # High Return Rate: Do not increase
+            elif return_rate > 0.15: # > 15% return rate
+                rec_price = current_price # Hold
+                action = "HOLD"
+                rationale = f"High Return Rate ({return_rate:.1%}). Maintaining price to avoid conversion drop."
+
+        # --- STEP 4: COMPETITIVE SANITY CHECK ---
+        
+        # If recommended price is way above market, cap it.
+        if rec_price > (comp_avg * 1.15):
+            rec_price = comp_avg * 1.10
+            rationale += " (Capped at Competitor Avg + 10% for competitiveness)"
+
+        # --- STEP 5: FINAL FLOOR VALIDATION ---
+        
+        if rec_price < min_price:
+            rec_price = min_price
+            rationale += " (Adjusted to meet Minimum Margin Floor)"
+
+        # Round to 2 decimals
+        rec_price = round(rec_price, 2)
+        
+        recommendations.append({
+            'SKU': sku,
+            'Description': row['Product_description'],
+            'Current_Price': current_price,
+            'Min_Acceptable_Price': round(min_price, 2),
+            'Days_Supply': days_supply,
+            'ROAS_7d': roas,
+            'Competitor_Avg': comp_avg,
+            'Action': action,
+            'Recommended_Price': rec_price,
+            'Change_%': round(((rec_price - current_price) / current_price) * 100, 1),
+            'Rationale': rationale
+        })
+        
+    return pd.DataFrame(recommendations)
+
+# --- MAIN EXECUTION BLOCK ---
+if __name__ == "__main__":
+    
+    # 1. Load Data
+    try:
+        pricing, inventory, competitor, ads, sales, returns = load_and_clean_data()
+        
+        # 2. Enrich Pricing Data with Economic Floors
+        pricing = calculate_economic_floor(pricing)
+        
+        # 3. Generate Recommendations
+        final_df = generate_recommendations(pricing, inventory, competitor, ads, sales, returns)
+        
+        # 4. Display Summary
+        print("\n--- Pricing Recommendations Summary ---")
+        print(final_df[['SKU', 'Current_Price', 'Recommended_Price', 'Action', 'Change_%', 'Rationale']].to_string(index=False))
+        
+        # 5. Save to CSV
+        output_filename = 'Final_Pricing_Recommendations.csv'
+        final_df.to_csv(output_filename, index=False)
+        print(f"\nFull report saved to: {output_filename}")
+        
+    except FileNotFoundError as e:
+        print(f"\nError: {e}. Please ensure all CSV files are in the directory.")
+```
