@@ -54,3 +54,203 @@
 | **MN-49** | 11 x 7 Rectangle - pk of 50 | $32.90 | **$41.90** | Margin Recovery | Costs ($30.56) require min $38.20. Competitor High is $41.90. |
 | **MN-50** | 9x6 Rectangle - pk of 50 | $29.90 | **$38.90** | Margin Recovery | Costs ($27.60) require min $34.50. Competitor High is $38.90. |
 
+## python script for data analysis and data visualization 
+```python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Set visualization style
+sns.set(style="whitegrid")
+
+# ---------------------------------------------------------
+# 1. Data Loading
+# ---------------------------------------------------------
+# In a real environment, these would be file paths. 
+# Here we assume the CSVs are in the current directory.
+df_pricing = pd.read_csv('Pricing_Data.csv')
+df_inventory = pd.read_csv('Inventory_Health.csv')
+df_competitor = pd.read_csv('Competitor_Data.csv')
+df_sales = pd.read_csv('Historical_Sales.csv')
+df_ads = pd.read_csv('Ads_Performance.csv')
+df_returns = pd.read_csv('Returns_Data.csv')
+
+# ---------------------------------------------------------
+# 2. Data Cleaning & Aggregation
+# ---------------------------------------------------------
+
+# Calculate Total Cost per unit in Pricing Data
+# Total Cost = FBA Fee + Storage Fee + Handling Cost + Cost (COGS)
+df_pricing['Total_Cost'] = (
+    df_pricing['FBA Fee'] + 
+    df_pricing['Storage Fee'] + 
+    df_pricing['Handling_Cost'] + 
+    df_pricing['Cost']
+)
+
+# Convert Margin percentages to decimals
+df_pricing['Min_Margin_Dec'] = df_pricing['Minimum_Acceptable_Margin_%'].str.rstrip('%').astype('float') / 100.0
+df_pricing['Target_Margin_Dec'] = df_pricing['Target_Gross_Margin_'].str.rstrip('%').astype('float') / 100.0
+
+# Aggregate Sales to get average daily units (last 30 days approx)
+# Using the provided history to calculate velocity
+# We assume the data covers roughly 30 days based on the row count for top SKUs
+df_sales_agg = df_sales.groupby('SKU').agg({
+    'Units Ordered': 'sum',
+    'Ordered Product Sales': 'sum'
+}).reset_index()
+df_sales_agg.rename(columns={'Units Ordered': 'Total_Units_Sold_History'}, inplace=True)
+
+# ---------------------------------------------------------
+# 3. Merging Datasets
+# ---------------------------------------------------------
+df = df_pricing.merge(df_inventory, on='SKU', how='left')
+df = df.merge(df_competitor, on='SKU', how='left')
+df = df.merge(df_sales_agg, on='SKU', how='left')
+
+# ---------------------------------------------------------
+# 4. Applying the Pricing Logic Framework
+# ---------------------------------------------------------
+
+def calculate_recommended_price(row):
+    total_cost = row['Total_Cost']
+    min_margin = row['Min_Margin_Dec']
+    target_margin = row['Target_Margin_Dec']
+    
+    # 1. Calculate Floor and Target Prices based on Margin
+    # Formula: Price = Cost / (1 - Margin)
+    min_price = total_cost / (1 - min_margin) if min_margin < 1 else total_cost * 1.5
+    target_price = total_cost / (1 - target_margin) if target_margin < 1 else total_cost * 2.0
+    
+    # 2. Inventory Adjustment Factor
+    dos = row['days-of-supply']
+    inv_factor = 1.0
+    if pd.notna(dos):
+        if dos > 90:
+            inv_factor = 0.95  # Discount to liquidate
+        elif dos < 30:
+            inv_factor = 1.05  # Premium on scarcity
+    
+    # Apply Inventory Adjustment to Target
+    dynamic_target = target_price * inv_factor
+    
+    # 3. Competitive Anchor
+    # We cap our price at the Highest Competitor Price to stay competitive
+    comp_high = row['Highest_Competitor_Price']
+    
+    # Handle missing competitor data (set a high cap if missing so margin logic wins)
+    if pd.isna(comp_high):
+        comp_cap = dynamic_target
+    else:
+        # Ensure comp_high is numeric (strip $ if necessary, though sample implies clean)
+        if isinstance(comp_high, str):
+            comp_high = float(comp_high.replace('$', ''))
+        comp_cap = comp_high
+    
+    # 4. Final Logic: Cap at competitor, but don't go below minimum margin
+    # Proposed Price
+    proposed = min(dynamic_target, comp_cap)
+    
+    # Sanity Check: If Min Margin is way higher than competitor, we have an unviable product.
+    # Strategy: Match Competitor (Liquidation) if Min Margin > Competitor Average
+    comp_avg = row['Avg_Competitor_Price']
+    if pd.notna(comp_avg):
+        if isinstance(comp_avg, str): comp_avg = float(comp_avg.replace('$', ''))
+        if min_price > comp_avg:
+            # Unprofitable product - Liquidate at Average Price
+            return comp_avg
+    
+    # Otherwise, standard logic
+    final_price = max(proposed, min_price)
+    
+    return round(final_price, 2)
+
+# Apply function
+df['Recommended_Price'] = df.apply(calculate_recommended_price, axis=1)
+
+# Calculate projected margins and price changes
+df['Proj_Gross_Margin_%'] = ((df['Recommended_Price'] - df['Total_Cost']) / df['Recommended_Price']) * 100
+df['Price_Change_$'] = df['Recommended_Price'] - df['Current_Price']
+df['Price_Change_%'] = (df['Price_Change_$'] / df['Current_Price']) * 100
+
+# ---------------------------------------------------------
+# 5. Data Analysis Outputs
+# ---------------------------------------------------------
+
+print("--- Pricing Strategy Analysis Summary ---")
+print(f"Total SKUs Analyzed: {len(df)}")
+print(f"SKUs requiring Price Increase: {len(df[df['Price_Change_$'] > 0])}")
+print(f"SKUs requiring Price Decrease: {len(df[df['Price_Change_$'] < 0])}")
+print("\n--- Sample Recommendations (Top 10 by Volume) ---")
+# Sort by sales volume to show high impact items
+top_skus = df.sort_values(by='Total_Units_Sold_History', ascending=False).head(10)
+cols_to_show = ['SKU', 'Product_description', 'Current_Price', 'Recommended_Price', 'Price_Change_%', 'Proj_Gross_Margin_%', 'days-of-supply']
+print(top_skus[cols_to_show].to_string(index=False))
+
+# ---------------------------------------------------------
+# 6. Visualization
+# ---------------------------------------------------------
+
+fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+fig.suptitle('XYZ Company Pricing Strategy Dashboard', fontsize=16)
+
+# Plot 1: Current vs Recommended Price (Sample)
+plot_data = df.sort_values('Total_Units_Sold_History', ascending=False).head(15)
+x = np.arange(len(plot_data['SKU']))
+width = 0.35
+
+axes[0, 0].bar(x - width/2, plot_data['Current_Price'], width, label='Current Price', color='skyblue')
+axes[0, 0].bar(x + width/2, plot_data['Recommended_Price'], width, label='Recommended Price', color='orange')
+axes[0, 0].set_xlabel('SKU')
+axes[0, 0].set_ylabel('Price ($)')
+axes[0, 0].set_title('Current vs Recommended Price (Top 15 SKUs by Sales)')
+axes[0, 0].set_xticks(x)
+axes[0, 0].set_xticklabels(plot_data['SKU'], rotation=45, ha='right')
+axes[0, 0].legend()
+
+# Plot 2: Margin Recovery
+axes[0, 1].scatter(df['Current_Price'], df['Total_Cost'], alpha=0.5, label='Current Position', color='red')
+axes[0, 1].scatter(df['Recommended_Price'], df['Total_Cost'], alpha=0.5, label='Projected Position', color='green')
+axes[0, 1].plot([0, 100], [0, 100], 'k--', label='Zero Margin') # Approximation of cost line
+axes[0, 1].set_xlabel('Price')
+axes[0, 1].set_ylabel('Total Unit Cost ($)')
+axes[0, 1].set_title('Price vs Cost Positioning')
+axes[0, 1].legend()
+
+# Plot 3: Price Change vs Inventory Days of Supply
+colors = ['red' if x < 0 else 'green' for x in df['Price_Change_$']]
+axes[1, 0].scatter(df['days-of-supply'], df['Price_Change_%'], c=colors, alpha=0.6)
+axes[1, 0].axhline(0, color='black', linewidth=1)
+axes[1, 0].axvline(30, color='gray', linestyle='--', label='Low Stock Threshold')
+axes[1, 0].axvline(90, color='gray', linestyle='--', label='Overstock Threshold')
+axes[1, 0].set_xlabel('Days of Supply')
+axes[1, 0].set_ylabel('Price Change (%)')
+axes[1, 0].set_title('Inventory Health vs. Price Adjustment')
+axes[1, 0].legend()
+
+# Plot 4: Competitive Positioning Index
+# Index = Our Price / Competitor Avg Price
+df['Comp_Index_Current'] = df['Current_Price'] / df['Avg_Competitor_Price']
+df['Comp_Index_Rec'] = df['Recommended_Price'] / df['Avg_Competitor_Price']
+
+# Filter for plotting
+comp_plot = df.dropna(subset=['Avg_Competitor_Price'])
+axes[1, 1].scatter(comp_plot['Comp_Index_Current'], comp_plot['Comp_Index_Rec'], alpha=0.6)
+axes[1, 1].plot([0.5, 1.5], [0.5, 1.5], 'k--', alpha=0.5) # Diagonal
+axes[1, 1].axhline(1.0, color='blue', linestyle='--', alpha=0.3) # Market Average
+axes[1, 1].axvline(1.0, color='blue', linestyle='--', alpha=0.3) # Market Average
+axes[1, 1].set_xlabel('Current Price / Competitor Avg')
+axes[1, 1].set_ylabel('Recommended Price / Competitor Avg')
+axes[1, 1].set_title('Competitive Price Index Shift')
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+# ---------------------------------------------------------
+# 7. Save Recommendations
+# ---------------------------------------------------------
+output_cols = ['SKU', 'Current_Price', 'Recommended_Price', 'Price_Change_$', 'Price_Change_%', 'days-of-supply', 'Avg_Competitor_Price']
+df[output_cols].to_csv('Final_Pricing_Recommendations.csv', index=False)
+print("\nRecommendations saved to 'Final_Pricing_Recommendations.csv'")
+```
